@@ -80,7 +80,7 @@ contract Remittance is OwnablePausable {
             newRemittance.sentAmount = msg.value;
             newRemittance.feeAmount = currentFlatFee;
             newRemittance.sendingParty = msg.sender;
-            newRemittance.hashedSecret = hashedSecret;
+            newRemittance.hashedSecret = hashedSecret; // hashed secret derived from sender and receiver secrets
 
             newRemittance.whenTxRedeemable = txRedeemableTime;
             newRemittance.whenTxExpires = txExpirationTime;
@@ -118,10 +118,15 @@ contract Remittance is OwnablePausable {
         aRemittance.sendingParty.transfer(aRemittance.sentAmount);
     }
 
+    // potential intermediaries will need to submit a secretVerification
+    // using web3.utils.soliditySha3(the_secret, some_salt) or similar
+    // the_secret is itself the hash of the sending and receiving parties.
     function commitToCompleteRemittanceTx(uint remittanceId, bytes32 secretVerification) public softPausable {
         completionCommitments[keccak256(abi.encodePacked(remittanceId, msg.sender))] = secretVerification;
     }
 
+    // after committing the secretVerification hash, the intermediary can complete the remittance
+    // assuming their revealed secret matches their verification and the actual secret for the remittance
     function completeRemittanceTx(uint remittanceId, bytes32 secret, bytes32 salt) public softPausable {
 
         bytes32 secretVerification = completionCommitments[keccak256(abi.encodePacked(remittanceId, msg.sender))];
@@ -133,8 +138,8 @@ contract Remittance is OwnablePausable {
         require(aRemittance.sentAmount > 0, "Transaction has a zero-value.");
         require(aRemittance.whenTxRedeemable < block.timestamp, "Transaction is not yet redeemable.");
 
-        require(aRemittance.hashedSecret == keccak256(abi.encodePacked(secret)), "Secret mismatch!");
         require(secretVerification == keccak256(abi.encodePacked(secret, salt)), "Secret verification from commitment mismatch!");
+        require(aRemittance.hashedSecret == keccak256(abi.encodePacked(secret)), "Secret mismatch!");
 
         emit LogUnlockedBalance(aRemittance.sentAmount);
         emit LogRemittanceCompleted(msg.sender, aRemittance.feeAmount, aRemittance.sentAmount.sub(aRemittance.feeAmount));
