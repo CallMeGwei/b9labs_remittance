@@ -24,12 +24,8 @@ contract Remittance is OwnablePausable {
         // keep track of sending party in case of refund
         address payable sendingParty;
 
-        // keep track of address allowed to execute a transaction (otherwise front-running possible)
-        address payable allowedIntermediary;
-
-        // users will need to provide some strings that hash to these values
-        bytes32 authorizationDblHash1;
-        bytes32 authorizationDblHash2;
+        // users will need to prove they have access to some data that hashes to this
+        bytes32 hashedSecret;
 
         // time limits and expirations
         uint whenTxRedeemable;
@@ -38,6 +34,7 @@ contract Remittance is OwnablePausable {
 
     mapping (bytes32 => RemittanceTx) public remittances;
     mapping (uint => bytes32) public remittanceIdsToHashes;
+    mapping (bytes32 => bytes32) public completionCommitments;
 
     event LogChangedFeeAmount(address whoChanged, uint newFeeAmount);
     event LogCreatedRemittanceTx(address whoSent, uint whatValue, uint whatFee, address allowedIntermediary);
@@ -50,8 +47,8 @@ contract Remittance is OwnablePausable {
     // will add user adjustable valid-after and expiration times in next iteration
     constructor(uint initialFlatFee) public {
 
-        _maxFutureTime = 60 * 60 * 24 * 7; // can only be one week into the future
-        _maxExpiresTime = 60 * 60 * 24 * 14; // can only expire up to two weeks in the future
+        _maxFutureTime = 7 days; // can only be one week into the future
+        _maxExpiresTime = 14 days; // can only expire up to two weeks in the future
 
         currentFlatFee = initialFlatFee;
 
@@ -64,14 +61,7 @@ contract Remittance is OwnablePausable {
 
     }
 
-    function createNewRemittanceTx(
-        bytes32 dblHashedSecret1,
-        bytes32 dblHashedSecret2,
-        address payable allowedIntermediary,
-        uint txRedeemableTime,
-        uint txExpirationTime
-        )
-        public softPausable payable returns(uint){
+    function createNewRemittanceTx(bytes32 hashedSecret, uint txRedeemableTime, uint txExpirationTime) public softPausable payable returns(uint){
 
             require(msg.value > currentFlatFee, "You must send at least more ether than the fee.");
 
@@ -81,7 +71,7 @@ contract Remittance is OwnablePausable {
             require(txRedeemableTime < block.timestamp.add(_maxFutureTime), "Redeemable time is too far in the future.");
             require(txExpirationTime < block.timestamp.add(_maxExpiresTime), "Expiration time is too far in the future.");
 
-            bytes32 remittanceIdHash = keccak256(abi.encodePacked(msg.sender, dblHashedSecret1, dblHashedSecret2));
+            bytes32 remittanceIdHash = keccak256(abi.encodePacked(idCount, hashedSecret));
             RemittanceTx storage newRemittance = remittances[remittanceIdHash];
 
             remittanceIdsToHashes[idCount] = remittanceIdHash;
@@ -90,9 +80,8 @@ contract Remittance is OwnablePausable {
             newRemittance.sentAmount = msg.value;
             newRemittance.feeAmount = currentFlatFee;
             newRemittance.sendingParty = msg.sender;
-            newRemittance.allowedIntermediary = allowedIntermediary;
-            newRemittance.authorizationDblHash1 = dblHashedSecret1;
-            newRemittance.authorizationDblHash2 = dblHashedSecret2;
+            newRemittance.hashedSecret = hashedSecret;
+
             newRemittance.whenTxRedeemable = txRedeemableTime;
             newRemittance.whenTxExpires = txExpirationTime;
 
@@ -129,17 +118,23 @@ contract Remittance is OwnablePausable {
         aRemittance.sendingParty.transfer(aRemittance.sentAmount);
     }
 
-    function completeRemittanceTx(uint remittanceId, bytes32 hashedSecret1, bytes32 hashedSecret2) public softPausable {
+    function commitToCompleteRemittanceTx(uint remittanceId, bytes32 secretVerification) public softPausable {
+        completionCommitments[keccak256(abi.encodePacked(remittanceId, msg.sender))] = secretVerification;
+    }
+
+    function completeRemittanceTx(uint remittanceId, bytes32 secret, bytes32 salt) public softPausable {
+
+        bytes32 secretVerification = completionCommitments[keccak256(abi.encodePacked(remittanceId, msg.sender))];
+
+        require(secretVerification != 0x0, "You need to commit to complete this remittance before you can actually complete it.");
 
         RemittanceTx memory aRemittance = getRemittanceTxFromId(remittanceId);
 
         require(aRemittance.sentAmount > 0, "Transaction has a zero-value.");
         require(aRemittance.whenTxRedeemable < block.timestamp, "Transaction is not yet redeemable.");
 
-        bytes32 dblHashedSecret1 = keccak256(abi.encodePacked(hashedSecret1));
-        bytes32 dblHashedSecret2 = keccak256(abi.encodePacked(hashedSecret2));
-        require(aRemittance.authorizationDblHash1 == dblHashedSecret1, "Secret1 mismatch.");
-        require(aRemittance.authorizationDblHash2 == dblHashedSecret2, "Secret2 mismatch.");
+        require(aRemittance.hashedSecret == keccak256(abi.encodePacked(secret)), "Secret mismatch!");
+        require(secretVerification == keccak256(abi.encodePacked(secret, salt)), "Secret verification from commitment mismatch!");
 
         emit LogUnlockedBalance(aRemittance.sentAmount);
         emit LogRemittanceCompleted(msg.sender, aRemittance.feeAmount, aRemittance.sentAmount.sub(aRemittance.feeAmount));
@@ -147,22 +142,13 @@ contract Remittance is OwnablePausable {
          // remove the outstanding transaction
         delete(remittances[remittanceIdsToHashes[remittanceId]]);
         delete(remittanceIdsToHashes[remittanceId]);
+        delete(secretVerification);
 
         // and update the locked balance
         lockedBalance = lockedBalance.sub(aRemittance.sentAmount);
 
         // send amount to handler
-        aRemittance.allowedIntermediary.transfer(aRemittance.sentAmount);
-    }
-
-    function changeAllowedIntermediary(uint remittanceId, address payable newAllowedIntermediary) public softPausable {
-
-        RemittanceTx memory aRemittance = getRemittanceTxFromId(remittanceId);
-
-        require(msg.sender == aRemittance.sendingParty, "Only remittance sender can change remittance handler.");
-
-        RemittanceTx storage editableRemittance = remittances[remittanceIdsToHashes[remittanceId]];
-        editableRemittance.allowedIntermediary = newAllowedIntermediary;
+        msg.sender.transfer(aRemittance.sentAmount);
     }
 
     function withdrawFromUnlockedBalance(uint amountRequested, address payable whereTo) public onlyOwner softPausable {
